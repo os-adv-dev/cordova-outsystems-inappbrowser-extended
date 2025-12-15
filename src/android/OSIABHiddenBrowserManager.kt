@@ -9,7 +9,6 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import com.outsystems.plugins.inappbrowser.osinappbrowserlib.models.OSIABWebViewOptions
-import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -30,13 +29,18 @@ object OSIABHiddenBrowserManager {
         timeout: Int?,
         val completionHandler: (OSIABEventType, Any?) -> Unit
     ) {
-        private val webView: WebView
-        private val handler = Handler(Looper.getMainLooper())
+        // Handler MUST be initialized first, before anything else
+        private val mainHandler: Handler = Handler(Looper.getMainLooper())
+
         private var timeoutRunnable: Runnable? = null
         private var navigationCompletedRunnable: Runnable? = null
         private var firstLoadDone = false
+        @Volatile private var isDestroyed = false
         private val originalUrl = url
         private val navigationCompletedDelayMs: Long = options.navigationCompletedDelayMs.toLong()
+
+        // WebView is initialized last, after all other properties
+        private val webView: WebView
 
         /**
          * Helper function to extract the domain from a URL
@@ -89,12 +93,14 @@ object OSIABHiddenBrowserManager {
                 webViewClient = object : WebViewClient() {
                     override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
                         super.onPageStarted(view, url, favicon)
+                        if (isDestroyed) return
                         // Cancel any pending navigation completed events since a new navigation has started
-                        navigationCompletedRunnable?.let { handler.removeCallbacks(it) }
+                        navigationCompletedRunnable?.let { mainHandler.removeCallbacks(it) }
                         navigationCompletedRunnable = null
                     }
 
                     override fun onPageFinished(view: WebView?, url: String?) {
+                        if (isDestroyed) return
                         // Only fire BROWSER_PAGE_LOADED when we return to the original domain after potential SSO redirects
                         if (!firstLoadDone && matchesOriginalDomain(url)) {
                             firstLoadDone = true
@@ -102,14 +108,16 @@ object OSIABHiddenBrowserManager {
                         } else {
                             // Debounce the navigation completed event to handle redirect chains
                             // Cancel any pending event first
-                            navigationCompletedRunnable?.let { handler.removeCallbacks(it) }
+                            navigationCompletedRunnable?.let { mainHandler.removeCallbacks(it) }
 
                             // Schedule new event to fire after delay (configurable)
                             navigationCompletedRunnable = Runnable {
-                                completionHandler(OSIABEventType.BROWSER_PAGE_NAVIGATION_COMPLETED, url)
+                                if (!isDestroyed) {
+                                    completionHandler(OSIABEventType.BROWSER_PAGE_NAVIGATION_COMPLETED, url)
+                                }
                                 navigationCompletedRunnable = null
                             }
-                            handler.postDelayed(navigationCompletedRunnable!!, navigationCompletedDelayMs)
+                            mainHandler.postDelayed(navigationCompletedRunnable!!, navigationCompletedDelayMs)
                         }
                     }
 
@@ -119,6 +127,7 @@ object OSIABHiddenBrowserManager {
                         error: WebResourceError?
                     ) {
                         super.onReceivedError(view, request, error)
+                        if (isDestroyed) return
                         val errorData = mapOf("error" to (error?.description?.toString() ?: "Unknown error"))
                         completionHandler(OSIABEventType.BROWSER_FINISHED, errorData)
                     }
@@ -136,17 +145,20 @@ object OSIABHiddenBrowserManager {
             timeout?.let { timeoutSeconds ->
                 if (timeoutSeconds > 0) {
                     timeoutRunnable = Runnable {
-                        val timeoutData = mapOf("reason" to "timeout")
-                        completionHandler(OSIABEventType.BROWSER_FINISHED, timeoutData)
+                        if (!isDestroyed) {
+                            val timeoutData = mapOf("reason" to "timeout")
+                            completionHandler(OSIABEventType.BROWSER_FINISHED, timeoutData)
+                        }
                     }
-                    handler.postDelayed(timeoutRunnable!!, (timeoutSeconds * 1000).toLong())
+                    mainHandler.postDelayed(timeoutRunnable!!, (timeoutSeconds * 1000).toLong())
                 }
             }
         }
 
         fun cleanup() {
-            timeoutRunnable?.let { handler.removeCallbacks(it) }
-            navigationCompletedRunnable?.let { handler.removeCallbacks(it) }
+            isDestroyed = true
+            timeoutRunnable?.let { mainHandler.removeCallbacks(it) }
+            navigationCompletedRunnable?.let { mainHandler.removeCallbacks(it) }
             webView.stopLoading()
             webView.destroy()
         }
